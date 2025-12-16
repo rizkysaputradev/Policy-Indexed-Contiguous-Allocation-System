@@ -1069,7 +1069,7 @@ In accordance with the **derived predicates** listed as shown below:
 - **Layer full (MEM-LP):**
 
 $$
-\text{MEM-LP\_FULL}(i) \iff B_i \ge E_i
+\operatorname{MEM\_LP\_FULL}(i) \iff B_i \ge E_i
 $$
 
 - **MEM-TP reached:**
@@ -1211,7 +1211,7 @@ $$
 \text{pressure}(i) =
 \begin{cases}
 1, & \text{if } \text{mem\_lp\_full}(i) \\
-1, & \text{if } \frac{U_i}{C_i} \ge \alpha \\
+1, & \text{if } \dfrac{U_i}{C_i} \ge \alpha \\
 0, & \text{otherwise}
 \end{cases}
 $$
