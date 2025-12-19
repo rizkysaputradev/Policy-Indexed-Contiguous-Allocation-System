@@ -1069,7 +1069,7 @@ In accordance with the **derived predicates** listed as shown below:
 - **Layer full (MEM-LP):**
 
 $$
-\operatorname{MEM\_LP\_FULL}(i) \iff B_i \ge E_i
+\text{MEM-LP-FULL}(i) \iff B_i \ge E_i
 $$
 
 - **MEM-TP reached:**
@@ -1210,7 +1210,7 @@ Where the **pressure** is defined as the following:
 $$
 \text{pressure}(i) =
 \begin{cases}
-1, & \text{if } \text{mem\_lp\_full}(i) \\
+1, & \text{if } \text{mem-lp-full}(i) \in \text{MEM-LP-FULL(i)} \\
 1, & \text{if } \dfrac{U_i}{C_i} \ge \alpha \\
 0, & \text{otherwise}
 \end{cases}
@@ -1270,7 +1270,7 @@ An allocation succeeds if and only if:
 
 $$
 \exists i \in \mathcal{L}:
-B_i + \text{block\_total}(s) \le E_i
+B_i + \text{block-total}(s) \le E_i
 $$
 
 In which, these results are subject to:
