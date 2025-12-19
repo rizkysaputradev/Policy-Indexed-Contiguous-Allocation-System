@@ -1573,12 +1573,375 @@ As a result, the results shows as a possibility to:
 - Test **alternative policies** against **recorded workloads**,
 - Identify **pathological patterns** (thrashing, stranding).
 
-## 🏵️ **11. Build and Test Matrix**
+## 🎶 **11. Extended Mathematical Formalization**
+This section provides a **mathematically explicit** view of PICAS as a **layered, policy-driven allocation dynamical system**. The goal is to give a precise **formal scaffold** for reasoning about phase progression, spill, backfill decisions, and safety constraints.
+
+---
+
+### 🎸 **11.1. Initialization and Notations**
+Let:
+- Data layers: $\mathcal{D} = \{0,1,\dots,L-1\}$
+- Memory layers: $\mathcal{M} = \{0,1,\dots,L-1\}$
+- Allocation request at time $t$: $(s_t, d_t)$ where
+  - $s_t \in \mathbb{N}$ is requested bytes
+  - $d_t \in \mathcal{D}$ is the current data layer (conceptual phase)
+
+Define **block rounding** (the implementation’s `block_total`):
+
+$$
+B(s) \;=\; 16\left\lceil \frac{s + h}{16}\right\rceil
+\qquad \text{where } h = \mathrm{sizeof(BlockHeader)}.
+$$
+
+---
+
+### 🥃 **11.2. Memory Layer State (Discrete Dynamical System)**
+For each memory layer $\ell \in \mathcal{M}$, define a state vector:
+
+$$
+\mathbf{x}_\ell(t) =
+\begin{bmatrix}
+u_\ell(t)\\
+b_\ell(t)\\
+c_\ell\\
+\hat{l}_\ell(t)
+\end{bmatrix}
+$$
+
+Where:
+- $u_\ell(t)$ = bump-used bytes (monotone increasing)
+- $b_\ell(t)$ = bump pointer offset (equivalently $u_\ell(t)$ if no padding divergence)
+- $c_\ell$ = capacity (constant per run, from config)
+- $\hat{l}_\ell(t)$ = estimated live bytes (decreases on free; “approximate”)
+
+Discrete-time update under allocation event $t$ placed into memory layer $m_t$:
+
+$$
+u_{m_t}(t+1) = u_{m_t}(t) + B(s_t),
+\quad
+\hat{l}_{m_t}(t+1) = \hat{l}_{m_t}(t) + B(s_t).
+$$
+
+If freeing a block $i$ of total size $B_i$ belonging to layer $\ell$:
+
+$$
+\hat{l}_\ell(t+1) = \max\{0,\; \hat{l}_\ell(t) - B_i\}.
+$$
+
+Layer fullness (MEM-LP) is the predicate:
+
+$$
+\mathrm{FULL}_\ell(t) \;:=\; u_\ell(t) \ge c_\ell.
+$$
+
+Transitory point crossing (MEM-TP) uses configured threshold $\tau_\ell$:
+
+$$
+\mathrm{TP}_\ell(t) \;:=\; u_\ell(t) \ge \tau_\ell.
+$$
+
+---
+
+### 🪉 **11.3. Free List Bins (Size Class Mapping)**
+Let the bin index mapping be:
+
+$$
+\beta(x) = \min\left\{K-1,\; \left\lfloor \log_2(\max\{32,x\}) \right\rfloor \right\}
+$$
+
+Where $K=\texttt{kBins}$. For a request $s$, the allocator searches bins $\beta(B(s)) \to K-1$ for a free block of size $\ge B(s)$:
+
+$$
+\exists \; \text{block } j \in \bigcup_{k=\beta(B(s))}^{K-1}\mathcal{F}_{\ell,k}(t)
+\;\text{s.t.}\; \mathrm{size}(j)\ge B(s).
+$$
+
+Optional split rule with implementation threshold $B(32)$. If $\mathrm{size}(j) - B(s) \ge B(32)$, then perform the splitting into:
+
+$$
+j \mapsto (j_{\mathrm{alloc}}, j_{\mathrm{rem}}),
+\quad \mathrm{size}(j_{\mathrm{alloc}})=B(s),\;
+\mathrm{size}(j_{\mathrm{rem}})=\mathrm{size}(j)-B(s).
+$$
+
+---
+
+### 🪗 **11.4. Policy Engine (Constrained Optimizer)**
+At time $t$, define observed features:
+
+$$
+\mathbf{z}(t) =
+\Big(
+d_t,\; m_t,\; s_t,\;
+\mathrm{TP}_{m_t}(t),\;
+\mathrm{FULL}_{m_t}(t),\;
+\mathrm{prevIncomplete}(d_t),\;
+\mathrm{counts}(d_t),\;
+\mathrm{bytes}(d_t)
+\Big).
+$$
+
+The policy outputs an action:
+
+$$
+a_t = (\Delta d_t,\; m_t^\star,\; \mathrm{backfill}_t,\; \mathrm{spill}_t)
+$$
+
+where:
+- $\Delta d_t \in \{0,1\}$ indicates advancing data layer
+- $m_t^\star$ is the chosen memory layer
+- backfill/spill are booleans controlling non-default mapping.
+
+A practical and crucial formal view is a constrained minimization where:
+
+$$
+m_t^\star
+= \arg\min_{\ell \in \mathcal{M}}
+\Big(
+\underbrace{\lambda_1 \,\mathbb{I}[\ell \ne d_t]}_{\text{penalty / spill cost}}
++
+\underbrace{\lambda_2 \,\phi\!\left(\frac{u_\ell(t)}{c_\ell}\right)}_{\text{pressure cost}}
++
+\underbrace{\lambda_3 \,\psi(\ell,d_t)}_{\text{stranding / lifecycle cost}}
+\Big)
+$$
+
+and is subjected to the following condition:
+
+$$
+u_\ell(t)+B(s_t) \le c_\ell
+\quad \text{(must fit)}
+$$
+
+Or relaxed into the bounded probing such that:
+
+$$
+\ell \in \mathcal{N}_r(\ell_0)
+\quad \text{where} \quad
+\mathcal{N}_r(\ell_0)=\{\ell_0, \ell_0+1,\dots,\ell_0+r\}\ (\mathrm{mod}\ L).
+$$
+
+Here $\phi(\cdot)$ can be chosen as convex, with a sample such as:
+
+$$
+\phi(\rho) = \rho^2 \quad \text{or} \quad \phi(\rho)=\frac{1}{1-\rho}\;\;(\rho<1).
+$$
+
+---
+
+### 🚄 **11.5. Anti-Stranding (Hard Safety Constraint)**
+Define stranded memory in layer $\ell$ at time $t$:
+
+$$
+S_\ell(t) = \max\{0,\; c_\ell - u_\ell(t)\}.
+$$
+
+Anti-stranding triggers if and only if:
+
+$$
+S_\ell(t) > S_{\max}
+$$
+
+With the policy attempting to advance its phase jump while leaving significant unused capacity behind. The absent of this specified jump can formalized as such:
+
+$$
+\Delta d_t = 0
+\quad \text{if} \quad
+S_{m_t}(t) > S_{\max}
+\;\wedge\;
+\neg \mathrm{Pressure}(m_t,t).
+$$
+
+One possible pressure predicate matching implementation spirit likewise:
+
+$$
+\mathrm{Pressure}(\ell,t)
+:=
+\mathrm{FULL}_\ell(t)
+\;\vee\;
+\frac{u_\ell(t)}{c_\ell} \ge 0.9.
+$$
+
+---
+
+### 🍄 **11.6. Backfill (Earliest Incomplete Selection Rule)**
+Define earliest incomplete memory layer below data-layer $d_t$:
+
+$$
+\ell_{\mathrm{earliest}}(d_t,t) = \min\{\ell \in [0,d_t – 1]:\; u_\ell(t) < c_\ell\},
+$$
+
+With fallback to $d_t$ if none exists. Thus, the backfill mapping configured as the following:
+
+$$
+m_t^\star =
+\begin{cases}
+\ell_{\mathrm{earliest}}(d_t,t), & \mathrm{backfill}_t = 1\\
+m_t^\star, & \text{otherwise}
+\end{cases}
+$$
+
+This ensures the allocator can fill the empty holes in earlier memory layers, improving utilization under **phase drift**.
+
+---
+
+### 🔰 **11.7. Bounded Probing (Finite Horizon Search)**
+Given preferred memory layer $\ell_0$ and probe budget $P$ such that:
+
+$$
+m_t^\star =
+\min_{\ell \in \mathcal{N}_P(\ell_0)}
+\left\{
+\ell:\; u_\ell(t)+B(s_t)\le c_\ell
+\right\},
+$$
+
+or **no solution** if none found. This produces a predictable upper bound on search time.
+
+---
+
+### 💄 **11.8. Stochastic Derivation (Workloads)**
+Model allocation sizes in a given phase as a random variable likewise:
+
+$$
+S \sim \mathcal{D}_d
+$$
+
+And define expected per-allocation footprint as such:
+
+$$
+\mathbb{E}[B(S)] = \sum_{s} B(s)\,\Pr[S=s].
+$$
+
+Thereafter, the expected time to reach MEM-TP in layer $\ell$ under consistent placement is approximately at:
+
+$$
+T_{\mathrm{TP}}(\ell)
+\approx
+\frac{\tau_\ell - u_\ell(0)}{\mathbb{E}[B(S)]}.
+$$
+
+This allows policy tuning to be interpretable with thresholds $\tau_\ell$ become **expected within its phase durations**.
+
+---
+
+### 🫆 **11.9. Continuous Approximation (Long Run Services)**
+When allocations are dense, used-bytes can be treated as continuous such that:
+
+$$
+\frac{du_\ell}{dt} = \lambda_\ell(t)\,\mu_\ell(t)
+$$
+
+where:
+- $\lambda_\ell(t)$ is the allocation rate into layer $\ell$
+- $\mu_\ell(t)$ is expected block footprint $\mathbb{E}[B(S)]$
+
+A phase transition can be modeled as a switching condition where:
+
+$$
+d(t^+) = d(t) + 1
+\quad \text{when} \quad
+\mathrm{TLP}(d(t)) \;\vee\; \mathrm{TP}_{m(t)} \;\vee\; \mathrm{DataLP}(d(t)).
+$$
+
+This frames PICAS as a **hybrid system** with its continuous accumulation and discrete events.
+
+---
+
+### 🌺 **11.10. Matrix representation of cross-layer placement**
+Let $\mathbf{A}(t)\in\{0,1\}^{L\times L}$ represent the mapping of the data-layer allocations to its memory-layer placements where:
+
+$$
+A_{ij}(t)=1
+\iff
+\text{allocation at time }t\text{ originated from }d=i\text{ and placed into }m=j.
+$$
+
+The default diagonal placement is localized as such:
+
+$$
+A_{ij}(t)=\delta_{ij},
+$$
+
+Whilst the spill and backfill introduces the off-diagonal mass. As a result, the spill ratio is defined likewise:
+
+$$
+\mathrm{SpillRate}(T) =
+\frac{\sum_{t=1}^{T}\sum_{i\ne j}A_{ij}(t)}
+{\sum_{t=1}^{T}\sum_{i,j}A_{ij}(t)}.
+$$
+
+This is directly measurable from PICAS tracing logs.
+
+---
+
+### 🪸 **11.11. Aligned Allocation Correctness (Memalign Invariant)**
+For memalign, PICAS returns an aligned pointer $p_a$ such that:
+
+$$
+p_a \equiv 0 \pmod{a}
+$$
+
+The metadata stored $\mathrm{AlignTag}$ immediately before $p_a$. Additionally, the correctness invariant is declared as such:
+
+$$
+\mathrm{AlignTag}(p_a - |\mathrm{AlignTag}|).base = p_b,
+$$
+
+Where $p_b$ is the base pointer returned by `malloc(size + extra)`. Thus `free(p_a)` is reducible to `free(p_b)`:
+
+$$
+\mathrm{free}(p_a) \Rightarrow \mathrm{free}(p_b).
+$$
+
+This creates an aligned frees safe without knowing the internal bump and freelist specifications.
+
+---
+
+### 🐾 **11.12. Complexity Summary**
+
+Let:
+- $K$ = number of bins (`kBins`)
+- $n_k$ = number of nodes in bin \(k\)
+- $P$ = bounded probe budget (`max_layer_probes`)
+- $L$ = number of layers
+
+Then:
+
+- **Bin Search**:
+
+$$
+O\!\left(\sum_{k=\beta(B(s))}^{K-1} n_k\right)
+$$
+
+- **Bump Allocation**:
+
+$$
+O(1)
+$$
+
+- **Bounded Probing**:
+
+$$
+O(\min\{P,L\})
+$$
+
+Consequently, the overall allocation time is computed as such:
+
+$$
+T_{\mathrm{alloc}}(s)
+=
+O\!\left(\min\{P,L\} + \sum_{k=\beta(B(s))}^{K-1} n_k\right),
+$$
+
+With the general case approaching closely to $O(1)$ when **bins are shallow and bump is available**.
+
+## 🏵️ **12. Build and Test Matrix**
 PICAS is designed to be **easy to build, validate, and hard to misuse**.  This section documents the supported build modes, sanitizer coverage, canonical test and demo execution paths.
 
 ---
 
-### 🎧 **11.1. Supported Platforms**
+### 🎧 **12.1. Supported Platforms**
 | Platform | Compiler | Status | Notes |
 |---------|----------|--------|------|
 | macOS (Apple Silicon / Intel) | AppleClang / Clang++ | ✅ Supported | ASAN leak detector is not supported on macOS (workaround documented below). |
@@ -1587,10 +1950,10 @@ PICAS is designed to be **easy to build, validate, and hard to misuse**.  This s
 
 ---
 
-### ⛱️ **11.2. Build Types**
+### ⛱️ **12.2. Build Types**
 In general, PICAS supports two major build modes listed below, with **more adjustments** for future implementations.
 
-#### 🎱 **11.2.1. Release and Debug (Normal Build)**
+#### 🎱 **12.2.1. Release and Debug (Normal Build)**
 The following release is the standard mode for:
 - Development,
 - Benchmarking,
@@ -1604,7 +1967,7 @@ The following release is the standard mode for:
 
 ---
 
-#### 🎾 **11.2.2. Sanitized Build (ASAN + UBSAN)**
+#### 🎾 **12.2.2. Sanitized Build (ASAN + UBSAN)**
 On the other hand, this specific release is set as the correctness-validation mode for:
 - Catching heap issues,
 - Detecting UB,
@@ -1619,7 +1982,7 @@ PICAS applies sanitizer flags to **both the library and executables** via the `p
 
 ---
 
-### 🌏 **11.3. Build Targets**
+### 🌏 **12.3. Build Targets**
 | Target | Built When | Description |
 |--------|------------|-------------|
 | `libpicas.a` | always | PICAS allocator library |
@@ -1631,8 +1994,8 @@ PICAS applies sanitizer flags to **both the library and executables** via the `p
 
 ---
 
-### 🚃 **11.4. Canonical Build Commands (Manual)**
-#### 🛞 **11.4.1. Release**
+### 🚃 **12.4. Canonical Build Commands (Manual)**
+#### 🛞 **12.4.1. Release**
 ```bash
 rm -rf build
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -1640,7 +2003,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure -V
 ```
 
-#### 🚢 **11.4.2. Debug**
+#### 🚢 **12.4.2. Debug**
 ```bash
 rm -rf build
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
@@ -1648,7 +2011,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure -V
 ```
 
-#### ⏳ **11.4.3. Sanitizers (ASAN + USBAN)**
+#### ⏳ **12.4.3. Sanitizers (ASAN + USBAN)**
 ```bash
 rm -rf build_asan
 cmake -S . -B build_asan -DCMAKE_BUILD_TYPE=Debug -DPICAS_SANITIZE=ON
@@ -1658,7 +2021,7 @@ ctest --test-dir build_asan --output-on-failure -V
 
 ---
 
-### 🗿 **11.5. Leak Detector (MacOS Note)**
+### 🗿 **12.5. Leak Detector (MacOS Note)**
 On macOS, `AddressSanitizer` may abort if leak detection is forced through `AddressSanitizer: detect_leaks is not supported on this platform` warning message. Thus, **leak detection** for `ASAN` run are disabled:
 ```bash
 ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build_asan --output-on-failure -V
@@ -1668,7 +2031,7 @@ Consequently, the `06_test_asan_mac.sh` script exists alongside the Linux saniti
 
 ---
 
-### 🏎️ **11.6. Scripts Based Workflow**
+### 🏎️ **12.6. Scripts Based Workflow**
 PICAS includes a `scripts/` directory to standardize builds and avoid the machine functionalities and its drift. Furthermore, these scripts are intentionally wrapped along the **canonical** flow:
 
 <div align="center">
@@ -1688,7 +2051,7 @@ Let release and sanitizer builds to be **fully separated** (`build/` vs `build_a
 
 ---
 
-### 👾 **11.7. Release Pipeline**
+### 👾 **12.7. Release Pipeline**
 | Script | Purpose | Output Directory |
 |--------|---------|------------------|
 | `00_configure.sh` | Configure Release/normal build with CMake | `./build/` |
@@ -1697,7 +2060,7 @@ Let release and sanitizer builds to be **fully separated** (`build/` vs `build_a
 | `10_run_demo_realistic.sh` | Execute `demo_realistic` | `./build/demo_realistic` |
 | `11_run_demo_trace_dump.sh` | Execute `demo_trace_dump` (writes trace artifacts) | `./build/demo_trace_dump` |
 
-#### 🥼 **11.7.1. Typical Usage**
+#### 🥼 **12.7.1. Typical Usage**
 ```bash
 ./scripts/00_configure.sh
 ./scripts/01_build.sh
@@ -1706,7 +2069,7 @@ Let release and sanitizer builds to be **fully separated** (`build/` vs `build_a
 ./scripts/11_run_demo_trace_dump.sh
 ```
 
-#### 🏯 **11.7.2. Sanitizer Pipeline (ASAN + UBSAN)**
+#### 🏯 **12.7.2. Sanitizer Pipeline (ASAN + UBSAN)**
 PICAS provides a fully scripted sanitizer pipeline to **validate memory safety**, undefined behavior, and allocator invariants under **aggressive runtime instrumentation**. Specifically, the pipeline is designed to be:
 - **Reproducible**
 - **Cross-platform (macOS + Linux aware)**
@@ -1714,7 +2077,7 @@ PICAS provides a fully scripted sanitizer pipeline to **validate memory safety**
 
 ---
 
-### 🏠 **11.8. Pipeline Overview**
+### 🏠 **12.8. Pipeline Overview**
 | Script | Purpose | Output Directory |
 |------|--------|------------------|
 | `03_configure_asan.sh` | Configure sanitized build (`PICAS_SANITIZE=ON`) | `./build_asan` |
@@ -1722,14 +2085,14 @@ PICAS provides a fully scripted sanitizer pipeline to **validate memory safety**
 | `05_test_asan.sh` | Run sanitized tests (Linux default) | `./build_asan` |
 | `05_test_asan_mac.sh` | Run sanitized tests on macOS (leak detection disabled) | `./build_asan` |
 
-#### 🪀 **11.8.1. Typical Usage (MacOS)**
+#### 🪀 **12.8.1. Typical Usage (MacOS)**
 ```bash
 ./scripts/03_configure_asan.sh
 ./scripts/04_build_asan.sh
 ./scripts/05_test_asan_mac.sh
 ```
 
-#### ⚽️ **11.8.2. Typical Usage (Linux)**
+#### ⚽️ **12.8.2. Typical Usage (Linux)**
 ```bash
 ./scripts/03_configure_asan.sh
 ./scripts/04_build_asan.sh
@@ -1737,7 +2100,7 @@ PICAS provides a fully scripted sanitizer pipeline to **validate memory safety**
 ```
 > Given that Linux runs both ASAN and USBAN by default.
 
-#### 🔖 **11.8.3. Notes and Conventions**
+#### 🔖 **12.8.3. Notes and Conventions**
 - Always re-run configure when changing CMake options:
 	- Tests
 	- Examples
@@ -1753,13 +2116,13 @@ For unexpected build issues or errors are encountered, the simplest reset is dec
 rm -rf build build_asan
 ```
 
-#### 🎞️ **11.8.4. Generating Scripts Executable**
+#### 🎞️ **12.8.4. Generating Scripts Executable**
 After creating or cloning the repository, ensure that the scripts are executable:
 ```bash
 chmod +x scripts/*.sh
 ```
 
-### 🏆 **11.9. The Significance of Sanitizers**
+### 🏆 **12.9. The Significance of Sanitizers**
 Running PICAS under sanitizers allows the validation with:
 - Allocator header integrity (`BlockHeader.magic`)
 - Arena boundary checks
@@ -1767,12 +2130,12 @@ Running PICAS under sanitizers allows the validation with:
 - Aligned allocation safety (`AlignTag`)
 - Absence of use-after-free and OOB access
 
-## ⛲️ **12. Limitations of PICAS**
+## ⛲️ **13. Limitations of PICAS**
 PICAS is intentionally **ambitious** as it introduces capabilities that do not exist in conventional allocators, but that ambition comes with **clear trade-offs**. This section documents the current limitations from both a production and research perspective. These limitations are **not design flaws** but they are explicit boundaries of the current system.
 
 ---
 
-### 🪜 **12.1. Higher Conceptual Complexity**
+### 🪜 **13.1. Higher Conceptual Complexity**
 PICAS is **not a drop-in systematic replacement** for the standard `malloc`. On the other hand, PICAS is best suited for systems where memory behavior is **intentionally designed** and not incidental.
 - Developers is required to fully understand the listed concepts shown below:
   - Data layers
@@ -1784,7 +2147,7 @@ PICAS is **not a drop-in systematic replacement** for the standard `malloc`. On 
 
 ---
 
-### 🎣 **12.2. Policy Quality Directly Affects Outcomes**
+### 🎣 **13.2. Policy Quality Directly Affects Outcomes**
 Unlike traditional allocators that rely on decades of empirical tuning, PICAS behavior is **policy-driven** and shifted its responsibility from heuristics to **policy design discipline**.
 - A poorly designed policy has the capacity to:
   - Cause premature layer jumps,
@@ -1794,7 +2157,7 @@ Unlike traditional allocators that rely on decades of empirical tuning, PICAS be
 
 ---
 
-### ⚾️ **12.3. Higher Constant Factor Overhead**
+### ⚾️ **13.3. Higher Constant Factor Overhead**
 PICAS incurs **additional costs** compared to minimal allocators, such as:
 - Policy evaluation per allocation,
 - Layer bookkeeping,
@@ -1805,7 +2168,7 @@ Whilst the **asymptotic complexity** remains competitive and **constant factors 
 
 ---
 
-### 🪁 **12.4. Fragmentation Mitigation Is Partial Through Design**
+### 🪁 **13.4. Fragmentation Mitigation Is Partial Through Design**
 Recall that PICAS utilizes the following primary components:
 - Bump allocation,
 - Free-list bins,
@@ -1820,7 +2183,7 @@ In which, PICAS optimizes **behavioral structure** but not its **maximal spatial
 
 ---
 
-### 🛝 **12.5. Absence of Global Compaction or Object Relocation**
+### 🛝 **13.5. Absence of Global Compaction or Object Relocation**
 PICAS does **not move live allocations** as:
 - There is no object relocation,
 - No copying GC,
@@ -1835,7 +2198,7 @@ Additionally, a consideration on **long-lived fragmentations** were initiated to
 
 ---
 
-### 🎡 **12.6. Limited Cross Thread Optimization**
+### 🎡 **13.6. Limited Cross Thread Optimization**
 
 PICAS ensures a **thread based safety** system where **highly concurrent** yet **short-lived allocation** patterns may benefit from hybrid designs. However, the system list several limitations where:
 - Allocation decisions are primarily **per-layer**, not per-thread,
@@ -1844,7 +2207,7 @@ PICAS ensures a **thread based safety** system where **highly concurrent** yet *
 
 ---
 
-### 🎢 **12.7. OS and Platform Constraints**
+### 🎢 **13.7. OS and Platform Constraints**
 PICAS relies several constraints such that:
 - OS-backed virtual memory (`mmap` / `VirtualAlloc`),
 - **Sanitizer support** for correctness validation.
@@ -1857,7 +2220,7 @@ Note that Linux and MacOS are currently the best-supported environments.
 
 ---
 
-### 🌡️ **12.8. Research-Grade Configuration Sensitivity**
+### 🌡️ **13.8. Research-Grade Configuration Sensitivity**
 Small configuration changes can lead to large behavioral differences, particulary within:
 - Layer sizes,
 - Transitory thresholds,
@@ -1871,7 +2234,7 @@ To which, PICAS benefits strongly through:
 
 ---
 
-### 🛁 **12.9. Limited Ecosystem**
+### 🛁 **13.9. Limited Ecosystem**
 Given the novel allocator is configured where:
 - Tooling is early,
 - Integration examples are limited,
@@ -1879,12 +2242,12 @@ Given the novel allocator is configured where:
 
 Thus, early adopters should expect to be **co-designers** to enhance the practicality and applicability of PICAS.
 
-## 🛣️ **13. Future Work and Roadmaps**
+## 🛣️ **14. Future Work and Roadmaps**
 PICAS is designed as both a **usable allocator** and **long-term research platform**. The roadmap reflects the dual identity where each **planned feature** either increases **practical robustness** or deepens **theoretical and experimental expressiveness**. In addition, this section outlines **intentional future directions** to enhance the project.
 
 ---
 
-### 🍏 **13.1. Phase 1 (Stabilization and Documentation)**
+### 🍏 **14.1. Phase 1 (Stabilization and Documentation)**
 - Harden configuration validation (fail-fast on invalid layer setups)
 - Add policy visualization tools (`trace → decision` graph)
 - Expand test coverage for:
@@ -1899,7 +2262,7 @@ PICAS is designed as both a **usable allocator** and **long-term research platfo
 
 ---
 
-### 🍎 **13.2. Phase 2 (Policy Evolution and Extensibility)**
+### 🍎 **14.2. Phase 2 (Policy Evolution and Extensibility)**
 - Hot-swappable policies (runtime policy replacement)
 - Policy composition (hierarchical or chained policies)
 - Trace-driven offline policy training
@@ -1911,7 +2274,7 @@ PICAS is designed as both a **usable allocator** and **long-term research platfo
 
 ---
 
-### 🍐 **13.3. Phase 3 (Concurrency and Scalability Enhancements)**
+### 🍐 **14.3. Phase 3 (Concurrency and Scalability Enhancements)**
 - Thread-local allocation caches (policy-aware)
 - Lock-free or lock-reduced fast paths
 - NUMA-aware memory layer mapping
@@ -1920,7 +2283,7 @@ PICAS is designed as both a **usable allocator** and **long-term research platfo
 
 ---
 
-### 🍊 **13.4. Phase 4 (Advanced Memory Management Techniques)**
+### 🍊 **14.4. Phase 4 (Advanced Memory Management Techniques)**
 - Optional region-based deallocation modes
 - Epoch-aware bulk reclamation
 - Optional deferred free queues
@@ -1929,7 +2292,7 @@ PICAS is designed as both a **usable allocator** and **long-term research platfo
 
 ---
 
-### 🍋 **13.5. Phase 5 (Formalization and Verification)**
+### 🍋 **14.5. Phase 5 (Formalization and Verification)**
 - Formal specification of PICAS invariants
 - Proof sketches for:
   - Bounded stranding,
@@ -1940,7 +2303,7 @@ PICAS is designed as both a **usable allocator** and **long-term research platfo
 
 ---
 
-### 🍓 **13.6. Phase 6 (Tooling and Visualization)**
+### 🍓 **14.6. Phase 6 (Tooling and Visualization)**
 - Trace-to-graph visualizers
 - Timeline-based memory heatmaps
 - Layer pressure visualization
@@ -1952,7 +2315,7 @@ PICAS is designed as both a **usable allocator** and **long-term research platfo
 
 ---
 
-### 🍇 **13.7. Phase 7 (Language & Runtime Integration)**
+### 🍇 **14.7. Phase 7 (Language & Runtime Integration)**
 - Rust allocator backend (`GlobalAlloc`)
 - Python extension for experimental research
 - JVM / GraalVM native interface (exploratory)
@@ -1961,7 +2324,7 @@ PICAS is designed as both a **usable allocator** and **long-term research platfo
 
 ---
 
-### 🍈 **13.8. Phase 8 (Real-World Validation)**
+### 🍈 **14.8. Phase 8 (Real-World Validation)**
 - Integration into:
   - AI / ML pipelines,
   - Stream processing engines,
@@ -1975,7 +2338,7 @@ PICAS is designed as both a **usable allocator** and **long-term research platfo
 
 ---
 
-### 🥭 **13.9. Future Vision on PICAS**
+### 🥭 **14.9. Future Vision on PICAS**
 The long-term vision of PICAS is to **redefine what a memory allocator is allowed to know and decide**. Instead of treating memory as a passive resource, PICAS focus to create an allocation algorithm an system with:
 - Context-aware,
 - Policy-governed,
@@ -1984,7 +2347,7 @@ The long-term vision of PICAS is to **redefine what a memory allocator is allowe
 
 Consequently, PICAS is not solely a library but a practical yet reproducible **platform for memory systems**.
 
-## 👤 **14. Author and Credentials**
+## 👤 **15. Author and Credentials**
 This project is fully established and contributed by the following author:
 - **Name:** Rizky Johan Saputra
 - **Institution:** Independent
@@ -1992,7 +2355,7 @@ This project is fully established and contributed by the following author:
 - **Affiliation:** Undergraduate at Seoul National University (Enrolled at 2021, Graduating in 2026)
 - **Project Scope:** Memory Design, System Programming, Computer Architecture, Real-Time Systems and Hardware/Software Co-design.
 
-## 📜 **15. License**
+## 📜 **16. License**
 This repository is distributed under an Independent Personal License tailored by the author. See `LICENSE` for the full terms. For further inquiries and requests, please contact via GitHub or Email only.
 > If you intend to reuse significant portions for research and academia purposes, please open and inquire an issue to discuss attribution and terms.
 
